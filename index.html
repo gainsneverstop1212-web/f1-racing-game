@@ -951,7 +951,7 @@
     // Used instead of WebRTC P2P because direct connections are often blocked by NAT/firewalls.
     // Connects to several brokers at once and de-duplicates messages, so it survives one broker being down.
     (function () {
-      const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+      const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081'];
       const NS = 'f1gp2026/';
 
       class Emitter {
@@ -983,16 +983,18 @@
           this.opened = false; this.destroyed = false; this.claimChecking = false;
           if (typeof mqtt === 'undefined') { setTimeout(() => this.emit('error', { type: 'network' }), 0); return; }
           BROKERS.forEach(url => this._join(url));
-          this._failTimer = setTimeout(() => { if (!this.opened && !this.destroyed) this.emit('error', { type: 'network' }); }, 12000);
+          this._failTimer = setTimeout(() => { if (!this.opened && !this.destroyed) this.emit('error', { type: 'network', info: this.relayInfo() }); }, 12000);
           this._unload = () => this._shutdown(true);
           window.addEventListener('beforeunload', this._unload);
         }
+        relayInfo() { return this.clients.map(c => c._name + (c.connected ? ' OK' : ' BLOCKED')).join(', '); }
         get connections() { const o = {}; for (const k in this.conns) o[k] = [this.conns[k]]; return o; }
 
         _join(url) {
           const opts = { clientId: 'f1_' + this.id.slice(-12) + '_' + Math.random().toString(16).slice(2, 8), clean: true, reconnectPeriod: 3000, connectTimeout: 8000, keepalive: 30 };
           if (this.fixed) opts.will = { topic: NS + 'claim/' + this.id, payload: '', retain: true, qos: 0 };
           const c = mqtt.connect(url, opts);
+          c._name = url.replace(/^wss:\/\//, '').split(/[:/]/)[0].replace(/^(broker|test)\./, '').split('.')[0];
           c.on('connect', () => {
             c.subscribe(NS + 'in/' + this.id, { qos: 0 });
             if (this.fixed) c.subscribe(NS + 'claim/' + this.id, { qos: 0 });
@@ -1067,7 +1069,7 @@
             if (c.open || this.destroyed) return;
             clearInterval(c._iv);
             delete this.conns[remoteId]; c._dead = true;
-            this.emit('error', { type: 'peer-unavailable' });
+            this.emit('error', { type: 'peer-unavailable', info: this.relayInfo() });
           }, 13000);
           return c;
         }
@@ -2058,7 +2060,7 @@
             p.destroy();
             tryCreateHostPeer(attempts + 1);
           } else {
-            setLobbyStatus('Connection error: ' + err.type, true);
+            setLobbyStatus('Connection error: ' + err.type + (err.info ? ' [relay: ' + err.info + ']' : ''), true);
             document.getElementById('btn-create-room').disabled = false;
           }
         });
@@ -2141,11 +2143,11 @@
         // Give up with a clear message if the P2P link never opens
         const joinTimeout = setTimeout(() => {
           if (!conn.open) {
-            setLobbyStatus('Could not connect to host (network blocked). Try another network or ask host to retry.', true);
+            setLobbyStatus('Could not connect to host. Relay: ' + peer.relayInfo(), true);
             document.getElementById('btn-join-room').disabled = false;
             try { conn.close(); } catch (e) {}
           }
-        }, 20000);
+        }, 40000);
         conn.on('error', err => {
           setLobbyStatus('Connection error: ' + (err && err.type ? err.type : err), true);
           document.getElementById('btn-join-room').disabled = false;
@@ -2174,7 +2176,7 @@
       });
 
       p.on('error', err => {
-        setLobbyStatus('Could not join room: ' + err.type, true);
+        setLobbyStatus('Could not join room: ' + err.type + (err.info ? ' [relay: ' + err.info + ']' : ''), true);
         document.getElementById('btn-join-room').disabled = false;
       });
     });
