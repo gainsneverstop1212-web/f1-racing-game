@@ -1717,6 +1717,26 @@
     // 6. CIRCUIT & LAP SELECTION HELPERS + PEERJS MULTIPLAYER
     // =========================================================================
     const PEER_PREFIX = 'f1-2026-gp-room-';
+    // STUN + TURN fallbacks so connections work across strict NATs / mobile networks
+    const PEER_OPTIONS = {
+      config: {
+        iceCandidatePoolSize: 4,
+        iceServers: [
+          { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+          { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+          {
+            urls: [
+              'turn:openrelay.metered.ca:80',
+              'turn:openrelay.metered.ca:443',
+              'turn:openrelay.metered.ca:443?transport=tcp',
+              'turns:openrelay.metered.ca:443?transport=tcp'
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+          }
+        ]
+      }
+    };
     let peer = null;
     let isHost = false;
     let isMultiplayer = false;
@@ -1859,7 +1879,7 @@
       function tryCreateHostPeer(attempts = 0) {
         const code = String(Math.floor(1000 + Math.random() * 9000));
         const fullId = PEER_PREFIX + code;
-        const p = new Peer(fullId);
+        const p = new Peer(fullId, PEER_OPTIONS);
 
         p.on('open', id => {
           peer = p;
@@ -1982,7 +2002,7 @@
       document.getElementById('btn-join-room').disabled = true;
       setLobbyStatus(`Connecting to Room #${code}...`);
 
-      const p = new Peer();
+      const p = new Peer(undefined, PEER_OPTIONS);
       p.on('open', id => {
         peer = p;
         myPeerId = id;
@@ -1993,7 +2013,21 @@
         const conn = peer.connect(PEER_PREFIX + code, { reliable: false });
         guestToHostConn = conn;
 
+        // Give up with a clear message if the P2P link never opens
+        const joinTimeout = setTimeout(() => {
+          if (!conn.open) {
+            setLobbyStatus('Could not connect to host (network blocked). Try another network or ask host to retry.', true);
+            document.getElementById('btn-join-room').disabled = false;
+            try { conn.close(); } catch (e) {}
+          }
+        }, 20000);
+        conn.on('error', err => {
+          setLobbyStatus('Connection error: ' + (err && err.type ? err.type : err), true);
+          document.getElementById('btn-join-room').disabled = false;
+        });
+
         conn.on('open', () => {
+          clearTimeout(joinTimeout);
           setLobbyStatus('');
           setSettingsLockedForGuest(true);
           document.getElementById('setup-actions').style.display = 'none';
