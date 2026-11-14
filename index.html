@@ -943,9 +943,152 @@
     </div>
   </div>
 
-  <!-- Three.js r128 & PeerJS 1.5.2 -->
+  <!-- Three.js r128 & MQTT relay -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js"></script>
+  <script>
+    // Relay-based "Peer" shim (PeerJS-compatible subset) over public MQTT-over-WebSocket brokers.
+    // Used instead of WebRTC P2P because direct connections are often blocked by NAT/firewalls.
+    // Connects to several brokers at once and de-duplicates messages, so it survives one broker being down.
+    (function () {
+      const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+      const NS = 'f1gp2026/';
+
+      class Emitter {
+        constructor() { this._h = {}; }
+        on(e, f) { (this._h[e] = this._h[e] || []).push(f); return this; }
+        emit(e, ...a) { (this._h[e] || []).slice().forEach(f => { try { f(...a); } catch (err) { console.error(err); } }); }
+      }
+
+      class Conn extends Emitter {
+        constructor(peer, remote) { super(); this._p = peer; this.peer = remote; this.open = false; this._dead = false; }
+        send(d) { if (this.open && !this._dead) this._p._pub('in/' + this.peer, { t: 'd', d }); }
+        close() { if (this.open) this._p._pub('in/' + this.peer, { t: 'x' }); this._closed(); }
+        _closed() {
+          if (this._dead) return;
+          this._dead = true; this.open = false;
+          clearTimeout(this._to); clearInterval(this._iv);
+          if (this._p.conns[this.peer] === this) delete this._p.conns[this.peer];
+          this.emit('close');
+        }
+      }
+
+      class Peer extends Emitter {
+        constructor(id) {
+          super();
+          this.id = id || ('g' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
+          this.fixed = !!id;
+          this.token = Math.random().toString(36).slice(2);
+          this.conns = {}; this.clients = []; this.seen = new Set(); this.seq = 0;
+          this.opened = false; this.destroyed = false; this.claimChecking = false;
+          if (typeof mqtt === 'undefined') { setTimeout(() => this.emit('error', { type: 'network' }), 0); return; }
+          BROKERS.forEach(url => this._join(url));
+          this._failTimer = setTimeout(() => { if (!this.opened && !this.destroyed) this.emit('error', { type: 'network' }); }, 12000);
+          this._unload = () => this._shutdown(true);
+          window.addEventListener('beforeunload', this._unload);
+        }
+        get connections() { const o = {}; for (const k in this.conns) o[k] = [this.conns[k]]; return o; }
+
+        _join(url) {
+          const opts = { clientId: 'f1_' + this.id.slice(-12) + '_' + Math.random().toString(16).slice(2, 8), clean: true, reconnectPeriod: 3000, connectTimeout: 8000, keepalive: 30 };
+          if (this.fixed) opts.will = { topic: NS + 'claim/' + this.id, payload: '', retain: true, qos: 0 };
+          const c = mqtt.connect(url, opts);
+          c.on('connect', () => {
+            c.subscribe(NS + 'in/' + this.id, { qos: 0 });
+            if (this.fixed) c.subscribe(NS + 'claim/' + this.id, { qos: 0 });
+            this._onReady();
+          });
+          c.on('message', (topic, payload) => this._onMsg(topic, payload.toString()));
+          c.on('error', () => {});
+          this.clients.push(c);
+        }
+
+        _onReady() {
+          if (this.opened || this.claimChecking || this.destroyed) return;
+          if (!this.fixed) { this._open(); return; }
+          // Host: make sure nobody else already owns this room code (retained claim message).
+          this.claimChecking = true; this.claimTaken = false;
+          setTimeout(() => {
+            if (this.destroyed) return;
+            if (this.claimTaken) { this.emit('error', { type: 'unavailable-id' }); return; }
+            this.clients.forEach(c => { if (c.connected) c.publish(NS + 'claim/' + this.id, JSON.stringify({ c: this.token }), { retain: true, qos: 0 }); });
+            this._open();
+          }, 1200);
+        }
+
+        _open() { this.opened = true; clearTimeout(this._failTimer); this.emit('open', this.id); }
+
+        _pub(sub, obj) {
+          obj.from = this.id; obj.m = this.id + ':' + (++this.seq);
+          const s = JSON.stringify(obj);
+          this.clients.forEach(c => { if (c.connected) c.publish(NS + sub, s, { qos: 0 }); });
+        }
+
+        _onMsg(topic, str) {
+          if (this.destroyed) return;
+          if (topic === NS + 'claim/' + this.id) {
+            try { const o = JSON.parse(str); if (o && o.c && o.c !== this.token) this.claimTaken = true; } catch (e) {}
+            return;
+          }
+          let o; try { o = JSON.parse(str); } catch (e) { return; }
+          if (!o || !o.m || !o.from) return;
+          if (this.seen.has(o.m)) return;
+          this.seen.add(o.m);
+          if (this.seen.size > 4000) this.seen = new Set();
+          const from = o.from;
+          if (o.t === 'conn') {
+            if (!this.fixed) return;
+            if (!this.conns[from]) {
+              const c = new Conn(this, from); c.open = true; this.conns[from] = c;
+              this.emit('connection', c);
+              setTimeout(() => c.emit('open'), 0);
+            }
+            this._pub('in/' + from, { t: 'ack' });
+          } else if (o.t === 'ack') {
+            const c = this.conns[from];
+            if (c && !c.open && !c._dead) { c.open = true; clearTimeout(c._to); clearInterval(c._iv); c.emit('open'); }
+          } else if (o.t === 'd') {
+            const c = this.conns[from];
+            if (c && c.open) c.emit('data', o.d);
+          } else if (o.t === 'x') {
+            const c = this.conns[from];
+            if (c) c._closed();
+          }
+        }
+
+        connect(remoteId) {
+          const c = new Conn(this, remoteId);
+          this.conns[remoteId] = c;
+          let tries = 0;
+          const knock = () => { tries++; this._pub('in/' + remoteId, { t: 'conn' }); };
+          knock();
+          c._iv = setInterval(() => { if (!c.open && tries < 8) knock(); }, 1500);
+          c._to = setTimeout(() => {
+            if (c.open || this.destroyed) return;
+            clearInterval(c._iv);
+            delete this.conns[remoteId]; c._dead = true;
+            this.emit('error', { type: 'peer-unavailable' });
+          }, 13000);
+          return c;
+        }
+
+        _shutdown(notify) {
+          if (this.destroyed) return;
+          this.destroyed = true;
+          clearTimeout(this._failTimer);
+          window.removeEventListener('beforeunload', this._unload);
+          this.clients.forEach(c => {
+            if (!c.connected) return;
+            if (notify) for (const k in this.conns) c.publish(NS + 'in/' + k, JSON.stringify({ t: 'x', from: this.id, m: this.id + ':bye' + Math.random() }), { qos: 0 });
+            if (this.fixed) c.publish(NS + 'claim/' + this.id, '', { retain: true, qos: 0 });
+          });
+          setTimeout(() => this.clients.forEach(c => { try { c.end(true); } catch (e) {} }), 150);
+        }
+        destroy() { this._shutdown(true); }
+      }
+      window.Peer = Peer;
+    })();
+  </script>
   <script>
     // =========================================================================
     // 1. CIRCUITS, LIVERIES & RACE SETTINGS DATA
@@ -1718,25 +1861,7 @@
     // =========================================================================
     const PEER_PREFIX = 'f1-2026-gp-room-';
     // STUN + TURN fallbacks so connections work across strict NATs / mobile networks
-    const PEER_OPTIONS = {
-      config: {
-        iceCandidatePoolSize: 4,
-        iceServers: [
-          { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
-          { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
-          {
-            urls: [
-              'turn:openrelay.metered.ca:80',
-              'turn:openrelay.metered.ca:443',
-              'turn:openrelay.metered.ca:443?transport=tcp',
-              'turns:openrelay.metered.ca:443?transport=tcp'
-            ],
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-          }
-        ]
-      }
-    };
+    const PEER_OPTIONS = {}; // relay shim ignores WebRTC options
     let peer = null;
     let isHost = false;
     let isMultiplayer = false;
@@ -2674,7 +2799,7 @@
       updateHud(throttle, brake, currentU);
     }
 
-    // Broadcast local state at 20Hz
+    // Broadcast local state at 10Hz (relay mode)
     setInterval(() => {
       if (!isMultiplayer || !peer) return;
       const currentU = carState.closestIdx / TRACK_SAMPLES;
@@ -2698,7 +2823,7 @@
       } else if (guestToHostConn && guestToHostConn.open) {
         guestToHostConn.send({ type: 'CAR_STATE', state: payloadState });
       }
-    }, 50);
+    }, 100);
 
     // =========================================================================
     // 8. CAMERAS, TIMING TOWER STANDINGS & MINIMAP
